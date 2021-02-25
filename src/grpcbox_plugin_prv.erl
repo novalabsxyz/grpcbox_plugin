@@ -57,6 +57,7 @@ handle_app(AppInfo, Options, State) ->
     GrpcOpts = rebar_opts:get(Opts, grpc, []),
     GpbOpts = proplists:get_value(gpb_opts, GrpcOpts, []),
     BaseDir = rebar_app_info:dir(AppInfo),
+    OverrideGpbDDefaults = proplists:get_value(override_gpb_defaults, GrpcOpts, true),
     GrpcCreateServices = proplists:get_value(create_services, GrpcOpts, true),
     GrpcOptOutDir = proplists:get_value(out_dir, GrpcOpts, filename:join(BaseDir, "src")),
     BeamOutDir = proplists:get_value(beam_out_dir, GrpcOpts, rebar_app_info:ebin_dir(AppInfo)),
@@ -64,7 +65,7 @@ handle_app(AppInfo, Options, State) ->
     GrpcOutDir = filename:join(BaseDir, GrpcOptOutDir),
     GpbOutDir = filename:join(BaseDir, proplists:get_value(o, GpbOpts, GrpcOptOutDir)),
 
-   ProtoFiles = case proplists:get_all_values(proto_files, Options) of
+    ProtoFiles = case proplists:get_all_values(proto_files, Options) of
                  [] ->
                      case proplists:get_value(proto_files, GrpcOpts) of
                          undefined ->
@@ -98,7 +99,7 @@ handle_app(AppInfo, Options, State) ->
                    T
            end,
     Templates = templates(Type),
-    ProtoModules = [compile_pb(Filename, GpbOutDir, BeamOutDir, GpbOpts) || Filename <- ProtoFilesAbs],
+    ProtoModules = [compile_pb(Filename, GpbOutDir, BeamOutDir, GpbOpts, OverrideGpbDDefaults) || Filename <- ProtoFilesAbs],
     case GrpcCreateServices of
         true ->
            [gen_services(Templates, ProtoModule, ProtoBeam, GrpcOutDir, GrpcOpts, State)
@@ -112,7 +113,7 @@ handle_app(AppInfo, Options, State) ->
         false -> [file:delete(ProtoBeam) || {_ProtoModule, ProtoBeam} <- ProtoModules]
     end.
 
-compile_pb(Filename, OutDir, BeamOutDir, GpbOpts) ->
+compile_pb(Filename, OutDir, BeamOutDir, GpbOpts, OverrideGpbDDefaults) ->
     ModuleName = lists:flatten(
                    [proplists:get_value(module_name_prefix, GpbOpts, ""),
                     filename:basename(Filename, ".proto"),
@@ -123,16 +124,21 @@ compile_pb(Filename, OutDir, BeamOutDir, GpbOpts) ->
     case needs_update(Filename, GeneratedPB) of
         true ->
             rebar_log:log(info, "Writing ~s", [GeneratedPB]),
-            %% unless the calling app overrides, we will default defs_as_proplists to true
-            %% resulting in service defs using proplists
-            %% Overriding the default with a value of false will result in the service defs using maps
-            GpbDefsAsProplists = proplists:get_value(defs_as_proplists, GpbOpts, true),
-            case gpb_compile:file(Filename, [{rename,{msg_fqname,base_name}},
-                                             use_packages,
-                                             {defs_as_proplists, GpbDefsAsProplists},
-                                             {i, "."},
-                                             {report_errors, false},
-                                             {o, OutDir} | GpbOpts]) of
+            %% if OverrideGpbDDefaults is true,  drop all default gpb options
+            %% and use only those supplied by the calling service
+            %% otherwise append any supplied gpb options to grpcbox defaults
+            FinalGpbOpts =
+                case OverrideGpbDDefaults of
+                    true ->
+                        GpbOpts;
+                    false ->
+                        [{rename,{msg_name,snake_case}},
+                         {rename,{msg_fqname,base_name}},
+                         use_packages, maps,
+                         strings_as_binaries, {i, "."},
+                         {o, OutDir} | GpbOpts]
+                end,
+            case gpb_compile:file(Filename, FinalGpbOpts) of
                 ok ->
                     ok;
                 {error, Error} ->
@@ -184,8 +190,7 @@ gen_service_def(Service, ProtoModule, GrpcConfig, FullOutDir) ->
       methods => [resolve_method(M, ProtoModule) || M <- Methods]}.
 
 resolve_method(Method, ProtoModule) ->
-    %% if the gpb option defs_as_proplists is set to false, then service defs will be maps
-    %% so just force the methods to maps type here
+    %% handle methods as props or maps
     rebar_log:log(info, "METHOD: ~p", [Method]),
     MethodMap = ensure_map(Method),
     MessageType = {message_type, ProtoModule:msg_name_to_fqbin(maps:get(input, MethodMap))},
